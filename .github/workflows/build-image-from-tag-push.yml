@@ -1,0 +1,32 @@
+---
+name: Build image from version tag
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+on:
+  push:
+    # XXX: Tags pushed via actions (i.e., auto-semver) are not able to trigger additional workflows;
+    # they should instead go via an additional workflow_call.
+    tags: [ 'v[0-9]+.[0-9]+.[0-9]+' ]
+  pull_request:
+    branches: [ main ]
+  workflow_call:
+    inputs:
+      tag:
+        description: Base tag to build.
+        required: false
+        type: string
+
+jobs:
+  build:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    uses: discoverygarden/docker-image-reusable-workflows/.github/workflows/build-image.yml@v2
+    secrets: inherit
+    with:
+      image-name: ${{ vars.DOCKER_IMAGE_NAME }}
+      tag: ${{ inputs.tag }}
+      # XXX: ubuntu-latest moving to 24.04 seems to have caused some builds to
+      # start segfaulting, in particular: the arm64 build of TurboJPEG.
+      runs-on: ubuntu-22.04

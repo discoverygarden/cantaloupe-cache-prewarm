@@ -1,0 +1,28 @@
+---
+name: Auto Semver
+on:
+  pull_request:
+    types: closed
+    branches:
+      - main
+jobs:
+  update:
+    if: "github.event.pull_request.merged == true && !contains(github.event.pull_request.labels.*.name, 'no-update')"
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.semver.outputs.tag }}
+    steps:
+      - name: Run Auto Semver
+        id: semver
+        uses: discoverygarden/auto-semver@v1
+  build:
+    if: github.event.pull_request.merged == true && needs.update.outputs.tag
+    uses: ./.github/workflows/build-image-from-tag-push.yml
+    needs: update
+    secrets: inherit
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    with:
+      tag: ${{ needs.update.outputs.tag }}

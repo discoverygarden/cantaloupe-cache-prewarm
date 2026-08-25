@@ -1,0 +1,27 @@
+---
+name: Bot Pull-Request to Ticket
+on:
+  pull_request:
+    types: [opened]
+permissions:
+  pull-requests: write
+  repository-projects: read
+
+jobs:
+  bot-job:
+    runs-on: ubuntu-latest
+    if: "( github.actor == 'dependabot[bot]' || github.actor == 'renovate[bot]' ) && contains(github.event.pull_request.labels.*.name, 'major')"
+    steps:
+      - name: Create Issue
+        uses: discoverygarden/create-issue@v1
+        with:
+          project: IT
+          summary: "[${{ github.repository }}] ${{ github.actor }} update"
+          description: |
+            ${{ github.actor }} generated a PR to update a dependency.
+          transition: "Request QA Review"
+          deployment-instructions: "N/A"
+          jira-url: ${{ vars.JIRA_BASE_URL }}
+          jira-user: ${{ vars.JIRA_USER_EMAIL }}
+          jira-token: ${{ secrets.JIRA_API_TOKEN }}
+          slack-webhook: ${{ secrets.FEED_WORKFLOW_WEBHOOK }}

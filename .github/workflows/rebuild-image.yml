@@ -1,0 +1,31 @@
+---
+name: Rebuild image
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+on:
+  schedule:
+    - cron: '47 4 1 * *'
+  workflow_dispatch:
+    inputs:
+      env:
+        description: The env in which to rebuild.
+        required: false
+        type: choice
+        default: prod
+        options:
+          - dev
+          - prod
+
+jobs:
+  build:
+    uses: discoverygarden/docker-image-reusable-workflows/.github/workflows/build-image.yml@v2
+    secrets: inherit
+    with:
+      env: ${{ inputs.env || github.event_name == 'pull_request' && 'dev' || 'prod' }}
+      image-name: ${{ vars.DOCKER_IMAGE_NAME }}
+      # XXX: ubuntu-latest moving to 24.04 seems to have caused some builds to
+      # start segfaulting, in particular: the arm64 build of TurboJPEG.
+      runs-on: ubuntu-22.04
