@@ -13,12 +13,11 @@ Usage:
 import argparse
 import concurrent.futures
 import json
-import re
 import sys
 import time
 import urllib.request
 
-MANIFEST_ID_RE = re.compile(r'"manifestId":"([^"]+)"')
+DRUPAL_SETTINGS_MARKER = 'data-drupal-selector="drupal-settings-json"'
 
 
 def fetch(url, timeout=30):
@@ -27,15 +26,73 @@ def fetch(url, timeout=30):
         return resp.status, resp.read()
 
 
-def unescape_json_url(s):
-    return s.replace("\\/", "/")
+def extract_drupal_settings_json(page_html):
+    """Locate the drupal-settings-json script tag and return its raw contents."""
+    start = page_html.find(DRUPAL_SETTINGS_MARKER)
+    if start == -1:
+        return None
+    open_idx = page_html.find(">", start)
+    if open_idx == -1:
+        return None
+    open_idx += 1
+    close_idx = page_html.lower().find("</script>", open_idx)
+    if close_idx == -1:
+        return None
+    return page_html[open_idx:close_idx].strip()
+
+
+def manifest_id_from_viewer(viewers, viewer_id):
+    """Mirror sitectl-isle's viewer resolution: check windows[].manifestId,
+    falling back to the manifests dict's keys."""
+    for selector, viewer in viewers.items():
+        if not isinstance(viewer, dict):
+            continue
+        candidate_id = viewer.get("id") or selector.lstrip("#")
+        if candidate_id != viewer_id:
+            continue
+        for window in viewer.get("windows") or []:
+            if isinstance(window, dict) and window.get("manifestId"):
+                return window["manifestId"]
+        manifests = viewer.get("manifests")
+        if isinstance(manifests, dict):
+            for manifest_id in manifests:
+                if manifest_id:
+                    return manifest_id
+    return None
+
+
+def find_manifest_id(settings):
+    """Prefer settings['mirador_view_id'] if present, else the first viewer
+    with a resolvable manifestId -- same precedence sitectl-isle uses."""
+    mirador = settings.get("mirador")
+    if not isinstance(mirador, dict):
+        return None
+    viewers = mirador.get("viewers")
+    if not isinstance(viewers, dict) or not viewers:
+        return None
+
+    preferred = settings.get("mirador_view_id")
+    if isinstance(preferred, str) and preferred:
+        manifest_id = manifest_id_from_viewer(viewers, preferred)
+        if manifest_id:
+            return manifest_id
+
+    for selector in viewers:
+        manifest_id = manifest_id_from_viewer(viewers, selector.lstrip("#"))
+        if manifest_id:
+            return manifest_id
+    return None
 
 
 def extract_manifest_url(page_html):
-    m = MANIFEST_ID_RE.search(page_html)
-    if not m:
+    settings_json = extract_drupal_settings_json(page_html)
+    if not settings_json:
         return None
-    return unescape_json_url(m.group(1))
+    try:
+        settings = json.loads(settings_json)
+    except json.JSONDecodeError:
+        return None
+    return find_manifest_id(settings)
 
 
 def extract_warm_urls(manifest):
