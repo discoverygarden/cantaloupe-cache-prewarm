@@ -4,10 +4,16 @@ Pre-warms Cantaloupe's IIIF derivative cache for paged/Mirador content ahead
 of real visitors, so the first page-turn isn't slow.
 
 Built for [UO-134](https://discoverygarden.atlassian.net/browse/UO-134). The
-`sitectl isle cache mirador` tool (referenced in ISLE's docs) only supports
-IIIF Presentation API v2 manifests; DGI's `islandora_iiif_presentation_api`
-module serves v3, which `sitectl` silently fails to warm. This image wraps a
-small script that parses the v3 manifest format instead.
+`sitectl isle cache mirador` tool (referenced in ISLE's docs) was evaluated
+first, but its manifest parser hardcodes a filter requiring image URLs to
+contain `/iiif/3/` (IIIF Image API v3) — see
+[`collectManifestWarmURLsForMode` in `sitectl-isle`'s `cache.go`](https://github.com/libops/sitectl-isle/blob/main/cmd/cache.go).
+It correctly walks IIIF Presentation API v3 manifest structure (the format
+DGI's `islandora_iiif_presentation_api` module serves), but our Cantaloupe
+deployment serves IIIF **Image API v2** endpoints (`/iiif/2/...`) from
+within that v3 Presentation manifest, so every image/thumbnail URL gets
+silently filtered out and `sitectl` warms nothing, with no error. This image
+wraps a small script that has no such version filter.
 
 ## What it does
 
