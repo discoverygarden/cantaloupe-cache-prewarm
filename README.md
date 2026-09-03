@@ -36,6 +36,20 @@ Run `--help` for the full flag list (`--dry-run`, `--workers`, etc).
 Intended to run as a Kubernetes CronJob via the `cachePrewarm` values in the
 [`cantaloupe` Helm chart](https://github.com/discoverygarden/helm-charts/tree/main/charts/cantaloupe).
 
+## Testing
+
+`testing/create_test_book.php` is a drush script that seeds a synthetic
+Paged Content object (a parent + 5 pages, each with a Service File image
+media) on any Islandora site, for validating this warmer against a real
+IIIF manifest without needing pre-existing content. It assumes a managed
+file with fid 4 already exists on the target site to use as source image
+data — point it at a different fid if that's not the case.
+
+Run it against a target site with:
+```
+drush php:script testing/create_test_book.php
+```
+
 ## Known gaps
 
 - No built-in discovery of paged objects yet — the URL list is currently
