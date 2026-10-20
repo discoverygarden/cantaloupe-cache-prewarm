@@ -28,10 +28,10 @@ Given a list of paged-object page URLs, for each one:
 
 ```
 docker run --rm -v $(pwd)/urls.txt:/urls.txt cantaloupe-cache-prewarm:latest \
-  --url-file /urls.txt --workers 4
+  --url-file /urls.txt --workers 1
 ```
 
-Run `--help` for the full flag list (`--dry-run`, `--workers`, etc).
+Run `--help` for the full flag list (`--dry-run`, `--workers`, etc). `--workers` defaults to 1: higher values OOM-killed a 2Gi Cantaloupe in testing. The exit code is non-zero if any image or page failed.
 
 Intended to run as a Kubernetes CronJob via the `cachePrewarm` values in the
 [`cantaloupe` Helm chart](https://github.com/discoverygarden/helm-charts/tree/main/charts/cantaloupe).

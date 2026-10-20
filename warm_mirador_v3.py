@@ -8,7 +8,7 @@ and warms every image/thumbnail IIIF URL found in it so Cantaloupe's
 derivative cache is populated before a real visitor pages through the book.
 
 Usage:
-    python3 warm_mirador_v3.py --url-file urls.txt [--workers 4] [--dry-run]
+    python3 warm_mirador_v3.py --url-file urls.txt [--workers 1] [--dry-run]
 """
 import argparse
 import concurrent.futures
@@ -24,6 +24,16 @@ def fetch(url, timeout=30):
     req = urllib.request.Request(url, headers={"User-Agent": "mirador-cache-warmer/0.1"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read()
+
+
+def fetch_discard(url, timeout=60, chunk_size=64 * 1024):
+    """Request a URL and drain the body without holding it in memory; the
+    request is only made so Cantaloupe caches the derivative."""
+    req = urllib.request.Request(url, headers={"User-Agent": "mirador-cache-warmer/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        while resp.read(chunk_size):
+            pass
+        return resp.status
 
 
 def extract_drupal_settings_json(page_html):
@@ -141,7 +151,7 @@ def warm_object(page_url, dry_run=False):
 
     for u in warm_urls:
         try:
-            status, _ = fetch(u, timeout=60)
+            status = fetch_discard(u)
             if status == 200:
                 result["warmed"] += 1
             else:
@@ -154,10 +164,19 @@ def warm_object(page_url, dry_run=False):
     return result
 
 
+def positive_int(value):
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url-file", required=True, help="File with one paged-object page URL per line")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=positive_int, default=1,
+                    help="Concurrent objects. Keep at 1 unless Cantaloupe has memory headroom: "
+                         "opj_decompress subprocesses OOM-killed a 2Gi Cantaloupe at 2+ workers.")
     ap.add_argument("--dry-run", action="store_true", help="Only count URLs, don't fetch images")
     args = ap.parse_args()
 
@@ -177,9 +196,12 @@ def main():
     elapsed = time.time() - start
     total_warmed = sum(r["warmed"] for r in results)
     total_failed = sum(r["failed"] for r in results)
-    print(f"\nSummary: pages={len(urls)} warmed={total_warmed} failed={total_failed} elapsed={elapsed:.1f}s")
+    # Page/manifest-level errors never reach the per-image counters, so count
+    # them too: otherwise a run where every page failed would exit 0.
+    pages_errored = sum(1 for r in results if r["errors"])
+    print(f"\nSummary: pages={len(urls)} warmed={total_warmed} failed={total_failed} pages_errored={pages_errored} elapsed={elapsed:.1f}s")
 
-    if total_failed:
+    if total_failed or pages_errored:
         sys.exit(1)
 
 

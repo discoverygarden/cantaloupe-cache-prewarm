@@ -1,5 +1,7 @@
 FROM python:3.13-slim
 
+ENV PYTHONUNBUFFERED=1
+
 COPY warm_mirador_v3.py /usr/local/bin/warm_mirador_v3.py
 RUN chmod +x /usr/local/bin/warm_mirador_v3.py
 
