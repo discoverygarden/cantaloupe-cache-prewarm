@@ -14,7 +14,9 @@ import argparse
 import concurrent.futures
 import json
 import sys
+import threading
 import time
+import urllib.error
 import urllib.request
 
 DRUPAL_SETTINGS_MARKER = 'data-drupal-selector="drupal-settings-json"'
@@ -120,47 +122,86 @@ def extract_warm_urls(manifest):
     return urls
 
 
-def warm_object(page_url, dry_run=False):
-    result = {"page": page_url, "warmed": 0, "failed": 0, "errors": []}
-    try:
-        _, body = fetch(page_url)
-        html = body.decode("utf-8", errors="replace")
-    except Exception as e:
-        result["errors"].append(f"fetch page failed: {e}")
-        return result
+class CircuitBreaker:
+    """Trips after N consecutive image failures across all workers, so a
+    dead or restarting Cantaloupe doesn't make us wait out a timeout for every
+    remaining URL."""
 
-    manifest_url = extract_manifest_url(html)
-    if not manifest_url:
-        result["errors"].append("no manifestId found in page")
-        return result
+    def __init__(self, limit):
+        self.limit = limit
+        self.consecutive = 0
+        self.tripped = threading.Event()
+        self._lock = threading.Lock()
 
-    try:
-        _, body = fetch(manifest_url)
-        manifest = json.loads(body)
-    except Exception as e:
-        result["errors"].append(f"fetch/parse manifest failed: {e}")
-        return result
+    def record(self, ok):
+        with self._lock:
+            self.consecutive = 0 if ok else self.consecutive + 1
+            if self.limit and self.consecutive >= self.limit:
+                self.tripped.set()
 
-    warm_urls = extract_warm_urls(manifest)
-    result["manifest_url"] = manifest_url
-    result["total_urls"] = len(warm_urls)
 
-    if dry_run:
-        result["warmed"] = len(warm_urls)
-        return result
-
+def warm_images(result, warm_urls, breaker):
     for u in warm_urls:
+        if breaker.tripped.is_set():
+            result["fatal"].append("aborted: too many consecutive image failures")
+            return
         try:
             status = fetch_discard(u)
-            if status == 200:
-                result["warmed"] += 1
-            else:
-                result["failed"] += 1
+            ok = 200 <= status < 300
+            if not ok:
                 result["errors"].append(f"{u} -> HTTP {status}")
+        except urllib.error.HTTPError as e:
+            ok = False
+            result["errors"].append(f"{u} -> HTTP {e.code}")
         except Exception as e:
-            result["failed"] += 1
+            ok = False
             result["errors"].append(f"{u} -> {e}")
+        result["warmed" if ok else "failed"] += 1
+        breaker.record(ok)
 
+
+def warm_object(page_url, breaker, dry_run=False):
+    """errors: every problem (image or page level); fatal: page/manifest-level
+    problems only, which stop work on this object."""
+    result = {"page": page_url, "warmed": 0, "failed": 0, "errors": [], "fatal": []}
+    try:
+        if breaker.tripped.is_set():
+            result["fatal"].append("skipped: aborted after too many consecutive image failures")
+            return result
+
+        try:
+            _, body = fetch(page_url)
+            html = body.decode("utf-8", errors="replace")
+        except Exception as e:
+            result["fatal"].append(f"fetch page failed: {e}")
+            return result
+
+        manifest_url = extract_manifest_url(html)
+        if not manifest_url:
+            result["fatal"].append("no manifestId found in page")
+            return result
+
+        try:
+            _, body = fetch(manifest_url)
+            manifest = json.loads(body)
+        except Exception as e:
+            result["fatal"].append(f"fetch/parse manifest failed: {e}")
+            return result
+
+        warm_urls = extract_warm_urls(manifest)
+        result["manifest_url"] = manifest_url
+        result["total_urls"] = len(warm_urls)
+
+        if dry_run:
+            result["warmed"] = len(warm_urls)
+            return result
+
+        warm_images(result, warm_urls, breaker)
+    except Exception as e:
+        # One malformed object must not take down the whole run.
+        result["fatal"].append(f"unexpected error: {type(e).__name__}: {e}")
+    finally:
+        result["errors"] = result["fatal"] + result["errors"]
     return result
 
 
@@ -177,16 +218,22 @@ def main():
     ap.add_argument("--workers", type=positive_int, default=1,
                     help="Concurrent objects. Keep at 1 unless Cantaloupe has memory headroom: "
                          "opj_decompress subprocesses OOM-killed a 2Gi Cantaloupe at 2+ workers.")
+    ap.add_argument("--max-consecutive-failures", type=int, default=10,
+                    help="Abort the run after this many image requests in a row fail "
+                         "(0 disables). Guards against a dead or restarting Cantaloupe.")
     ap.add_argument("--dry-run", action="store_true", help="Only count URLs, don't fetch images")
     args = ap.parse_args()
 
     with open(args.url_file) as f:
-        urls = [line.strip() for line in f if line.strip()]
+        urls = [line.strip() for line in f if line.strip() and not line.lstrip().startswith("#")]
 
+    breaker = CircuitBreaker(args.max_consecutive_failures)
     start = time.time()
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for r in ex.map(lambda u: warm_object(u, args.dry_run), urls):
+        futures = [ex.submit(warm_object, u, breaker, args.dry_run) for u in urls]
+        for fut in concurrent.futures.as_completed(futures):
+            r = fut.result()
             results.append(r)
             status = "OK" if not r["errors"] else "ERR"
             print(f"[{status}] {r['page']} warmed={r['warmed']} failed={r['failed']} total={r.get('total_urls', 0)}")
@@ -196,10 +243,11 @@ def main():
     elapsed = time.time() - start
     total_warmed = sum(r["warmed"] for r in results)
     total_failed = sum(r["failed"] for r in results)
-    # Page/manifest-level errors never reach the per-image counters, so count
-    # them too: otherwise a run where every page failed would exit 0.
-    pages_errored = sum(1 for r in results if r["errors"])
-    print(f"\nSummary: pages={len(urls)} warmed={total_warmed} failed={total_failed} pages_errored={pages_errored} elapsed={elapsed:.1f}s")
+    # Page/manifest-level problems never reach the per-image counters, so count
+    # them separately: otherwise a run where every page failed would exit 0.
+    pages_errored = sum(1 for r in results if r["fatal"])
+    aborted = " ABORTED" if breaker.tripped.is_set() else ""
+    print(f"\nSummary: pages={len(urls)} warmed={total_warmed} failed={total_failed} pages_errored={pages_errored} elapsed={elapsed:.1f}s{aborted}")
 
     if total_failed or pages_errored:
         sys.exit(1)
