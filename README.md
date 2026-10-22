@@ -28,10 +28,10 @@ Given a list of paged-object page URLs, for each one:
 
 ```
 docker run --rm -v $(pwd)/urls.txt:/urls.txt cantaloupe-cache-prewarm:latest \
-  --url-file /urls.txt --workers 4
+  --url-file /urls.txt --workers 1
 ```
 
-Run `--help` for the full flag list (`--dry-run`, `--workers`, etc).
+Run `--help` for the full flag list (`--dry-run`, `--workers`, etc). `--workers` defaults to 1: higher values OOM-killed a 2Gi Cantaloupe in testing. The exit code is non-zero if any image or page failed. The run aborts after `--max-consecutive-failures` (default 10) outage-type failures in a row (connection errors, timeouts, 429/502/503/504), e.g. if Cantaloupe or Drupal is down. A 404 or 500 for one bad image doesn't count. Blank lines and `#` comments in the URL file are ignored.
 
 Intended to run as a Kubernetes CronJob via the `cachePrewarm` values in the
 [`cantaloupe` Helm chart](https://github.com/discoverygarden/helm-charts/tree/main/charts/cantaloupe).
