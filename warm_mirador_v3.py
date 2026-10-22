@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DRUPAL_SETTINGS_MARKER = 'data-drupal-selector="drupal-settings-json"'
@@ -164,6 +165,14 @@ def fetch_guarded(url, breaker):
     return out
 
 
+def rewrite_base(url, image_base):
+    """Point an image URL at image_base (scheme + host[:port]); path and query
+    are kept byte-for-byte so the Cantaloupe identifier is unchanged."""
+    parts = urllib.parse.urlsplit(url)
+    base = urllib.parse.urlsplit(image_base)
+    return urllib.parse.urlunsplit((base.scheme, base.netloc, parts.path, parts.query, ""))
+
+
 def warm_images(result, warm_urls, breaker):
     for u in warm_urls:
         if breaker.tripped.is_set():
@@ -188,7 +197,7 @@ def warm_images(result, warm_urls, breaker):
         breaker.record(outage)
 
 
-def warm_object(page_url, breaker, dry_run=False):
+def warm_object(page_url, breaker, dry_run=False, image_base=None):
     """errors: every message for this object; fatal: page/manifest-level
     problems that stop work on it; skipped: not (fully) processed because the
     breaker tripped."""
@@ -220,6 +229,8 @@ def warm_object(page_url, breaker, dry_run=False):
             return result
 
         warm_urls = extract_warm_urls(manifest)
+        if image_base:
+            warm_urls = [rewrite_base(u, image_base) for u in warm_urls]
         result["manifest_url"] = manifest_url
         result["total_urls"] = len(warm_urls)
 
@@ -250,6 +261,15 @@ def non_negative_int(value):
     return n
 
 
+def base_url(value):
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise argparse.ArgumentTypeError("must look like http://host[:port]")
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise argparse.ArgumentTypeError("must not include a path, query or fragment")
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url-file", required=True, help="File with one paged-object page URL per line")
@@ -260,6 +280,11 @@ def main():
                     help="Abort the run after this many outage-type failures in a row "
                          "(connection errors, timeouts, 429/502/503/504; 0 disables). "
                          "Guards against a dead or restarting Cantaloupe or Drupal.")
+    ap.add_argument("--image-base-url", type=base_url, default=None, metavar="URL",
+                    help="Send image requests to this scheme+host (e.g. http://svc-cantaloupe:8080) "
+                         "instead of the host in the manifest. Needed in-cluster, where the public "
+                         "hostname resolves to Drupal (no /iiif) and the ALB rejects cluster traffic. "
+                         "Page and manifest requests still use the URLs given.")
     ap.add_argument("--dry-run", action="store_true", help="Only count URLs, don't fetch images")
     args = ap.parse_args()
 
@@ -270,7 +295,7 @@ def main():
     start = time.time()
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(warm_object, u, breaker, args.dry_run) for u in urls]
+        futures = [ex.submit(warm_object, u, breaker, args.dry_run, args.image_base_url) for u in urls]
         for fut in concurrent.futures.as_completed(futures):
             r = fut.result()
             results.append(r)
