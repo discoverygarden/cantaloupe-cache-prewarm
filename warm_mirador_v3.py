@@ -122,10 +122,17 @@ def extract_warm_urls(manifest):
     return urls
 
 
+# HTTP statuses that mean "the service is unavailable", as opposed to a
+# per-image problem (404/415/500 for a missing or corrupt source file).
+OUTAGE_STATUSES = {429, 502, 503, 504}
+
+
 class CircuitBreaker:
-    """Trips after N consecutive image failures across all workers, so a
-    dead or restarting Cantaloupe doesn't make us wait out a timeout for every
-    remaining URL."""
+    """Trips after N consecutive outage-type failures across all workers
+    (connection errors, timeouts, 429/502/503/504), so a dead or restarting
+    Cantaloupe or Drupal doesn't make us wait out a timeout for every
+    remaining URL. Any other HTTP response proves the service is up and
+    resets the streak."""
 
     def __init__(self, limit):
         self.limit = limit
@@ -133,18 +140,37 @@ class CircuitBreaker:
         self.tripped = threading.Event()
         self._lock = threading.Lock()
 
-    def record(self, ok):
+    def record(self, outage):
         with self._lock:
-            self.consecutive = 0 if ok else self.consecutive + 1
+            self.consecutive = self.consecutive + 1 if outage else 0
             if self.limit and self.consecutive >= self.limit:
                 self.tripped.set()
+
+
+def is_outage(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in OUTAGE_STATUSES
+    return True
+
+
+def fetch_guarded(url, breaker):
+    """fetch() that feeds the breaker; used for page and manifest requests."""
+    try:
+        out = fetch(url)
+    except Exception as e:
+        breaker.record(is_outage(e))
+        raise
+    breaker.record(False)
+    return out
 
 
 def warm_images(result, warm_urls, breaker):
     for u in warm_urls:
         if breaker.tripped.is_set():
-            result["fatal"].append("aborted: too many consecutive image failures")
+            result["skipped"] = True
+            result["errors"].append("aborted: too many consecutive outage-type failures")
             return
+        outage = False
         try:
             status = fetch_discard(u)
             ok = 200 <= status < 300
@@ -152,25 +178,30 @@ def warm_images(result, warm_urls, breaker):
                 result["errors"].append(f"{u} -> HTTP {status}")
         except urllib.error.HTTPError as e:
             ok = False
+            outage = is_outage(e)
             result["errors"].append(f"{u} -> HTTP {e.code}")
         except Exception as e:
             ok = False
+            outage = True
             result["errors"].append(f"{u} -> {e}")
         result["warmed" if ok else "failed"] += 1
-        breaker.record(ok)
+        breaker.record(outage)
 
 
 def warm_object(page_url, breaker, dry_run=False):
-    """errors: every problem (image or page level); fatal: page/manifest-level
-    problems only, which stop work on this object."""
-    result = {"page": page_url, "warmed": 0, "failed": 0, "errors": [], "fatal": []}
+    """errors: every message for this object; fatal: page/manifest-level
+    problems that stop work on it; skipped: not (fully) processed because the
+    breaker tripped."""
+    result = {"page": page_url, "warmed": 0, "failed": 0, "errors": [],
+              "fatal": [], "skipped": False}
     try:
         if breaker.tripped.is_set():
-            result["fatal"].append("skipped: aborted after too many consecutive image failures")
+            result["skipped"] = True
+            result["errors"].append("skipped: aborted after too many consecutive outage-type failures")
             return result
 
         try:
-            _, body = fetch(page_url)
+            _, body = fetch_guarded(page_url, breaker)
             html = body.decode("utf-8", errors="replace")
         except Exception as e:
             result["fatal"].append(f"fetch page failed: {e}")
@@ -182,7 +213,7 @@ def warm_object(page_url, breaker, dry_run=False):
             return result
 
         try:
-            _, body = fetch(manifest_url)
+            _, body = fetch_guarded(manifest_url, breaker)
             manifest = json.loads(body)
         except Exception as e:
             result["fatal"].append(f"fetch/parse manifest failed: {e}")
@@ -212,15 +243,23 @@ def positive_int(value):
     return n
 
 
+def non_negative_int(value):
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return n
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url-file", required=True, help="File with one paged-object page URL per line")
     ap.add_argument("--workers", type=positive_int, default=1,
                     help="Concurrent objects. Keep at 1 unless Cantaloupe has memory headroom: "
                          "opj_decompress subprocesses OOM-killed a 2Gi Cantaloupe at 2+ workers.")
-    ap.add_argument("--max-consecutive-failures", type=int, default=10,
-                    help="Abort the run after this many image requests in a row fail "
-                         "(0 disables). Guards against a dead or restarting Cantaloupe.")
+    ap.add_argument("--max-consecutive-failures", type=non_negative_int, default=10,
+                    help="Abort the run after this many outage-type failures in a row "
+                         "(connection errors, timeouts, 429/502/503/504; 0 disables). "
+                         "Guards against a dead or restarting Cantaloupe or Drupal.")
     ap.add_argument("--dry-run", action="store_true", help="Only count URLs, don't fetch images")
     args = ap.parse_args()
 
@@ -246,10 +285,13 @@ def main():
     # Page/manifest-level problems never reach the per-image counters, so count
     # them separately: otherwise a run where every page failed would exit 0.
     pages_errored = sum(1 for r in results if r["fatal"])
-    aborted = " ABORTED" if breaker.tripped.is_set() else ""
-    print(f"\nSummary: pages={len(urls)} warmed={total_warmed} failed={total_failed} pages_errored={pages_errored} elapsed={elapsed:.1f}s{aborted}")
+    pages_skipped = sum(1 for r in results if r["skipped"])
+    aborted = breaker.tripped.is_set()
+    print(f"\nSummary: pages={len(urls)} processed={len(urls) - pages_skipped} warmed={total_warmed} "
+          f"failed={total_failed} pages_errored={pages_errored} pages_skipped={pages_skipped} "
+          f"elapsed={elapsed:.1f}s{' ABORTED' if aborted else ''}")
 
-    if total_failed or pages_errored:
+    if total_failed or pages_errored or aborted:
         sys.exit(1)
 
 
