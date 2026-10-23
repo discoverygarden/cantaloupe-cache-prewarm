@@ -33,12 +33,14 @@ docker run --rm -v $(pwd)/urls.txt:/urls.txt cantaloupe-cache-prewarm:latest \
 
 Run `--help` for the full flag list (`--dry-run`, `--workers`, etc). `--workers` defaults to 1: higher values OOM-killed a 2Gi Cantaloupe in testing. The exit code is non-zero if any image or page failed. The run aborts after `--max-consecutive-failures` (default 10) outage-type failures in a row (connection errors, timeouts, 429/502/503/504), e.g. if Cantaloupe or Drupal is down. A 404 or 500 for one bad image doesn't count. Blank lines and `#` comments in the URL file are ignored.
 
-`--image-base-url http://svc-cantaloupe:8080` sends image requests straight to the in-cluster Cantaloupe Service (only scheme and host are replaced; the IIIF path is untouched). Use it when running in the cluster: there, the site's public hostname resolves to Drupal, which 404s `/iiif/...`, and the ALB rejects cluster-originated traffic. Page and manifest requests still go to the URLs in the URL file.
+`--image-base-url http://svc-cantaloupe:8080` sends image requests straight to the in-cluster Cantaloupe Service (only scheme and host are replaced on absolute `/iiif/` URLs; the IIIF path is untouched and any other URL is left as is). Credentials, paths and bad ports in the value are rejected at startup. Use it when running in the cluster: there, the site's public hostname resolves to Drupal, which 404s `/iiif/...`, and the ALB rejects cluster-originated traffic. Page and manifest requests still go to the URLs in the URL file.
 
 Intended to run as a Kubernetes CronJob via the `cachePrewarm` values in the
 [`cantaloupe` Helm chart](https://github.com/discoverygarden/helm-charts/tree/main/charts/cantaloupe).
 
 ## Testing
+
+Unit tests: `python3 -m unittest discover -s tests`.
 
 `testing/create_test_book.php` is a drush script that seeds a synthetic
 Paged Content object (a parent + 5 pages, each with a Service File image

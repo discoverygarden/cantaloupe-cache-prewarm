@@ -166,11 +166,14 @@ def fetch_guarded(url, breaker):
 
 
 def rewrite_base(url, image_base):
-    """Point an image URL at image_base (scheme + host[:port]); path and query
-    are kept byte-for-byte so the Cantaloupe identifier is unchanged."""
+    """Point an IIIF image URL at image_base (a normalised scheme://host[:port]);
+    path and query are kept byte-for-byte so the Cantaloupe identifier is
+    unchanged. Anything that isn't an absolute http(s) URL with /iiif/ in its
+    path (relative paths, data: URIs, static files) is returned untouched."""
     parts = urllib.parse.urlsplit(url)
-    base = urllib.parse.urlsplit(image_base)
-    return urllib.parse.urlunsplit((base.scheme, base.netloc, parts.path, parts.query, ""))
+    if parts.scheme not in ("http", "https") or not parts.netloc or "/iiif/" not in parts.path:
+        return url
+    return image_base + parts.path + (f"?{parts.query}" if parts.query else "")
 
 
 def warm_images(result, warm_urls, breaker):
@@ -197,14 +200,20 @@ def warm_images(result, warm_urls, breaker):
         breaker.record(outage)
 
 
-def warm_object(page_url, breaker, dry_run=False, image_base=None):
-    """errors: every message for this object; fatal: page/manifest-level
+def warm_object(page_url, breaker, dry_run=False, image_base=None, image_breaker=None):
+    """breaker guards page/manifest (Drupal) requests; image_breaker guards image
+    requests and defaults to the same one. They must differ when image_base
+    points at another service, or successful Drupal fetches keep resetting the
+    streak of a dead Cantaloupe.
+
+    errors: every message for this object; fatal: page/manifest-level
     problems that stop work on it; skipped: not (fully) processed because the
     breaker tripped."""
     result = {"page": page_url, "warmed": 0, "failed": 0, "errors": [],
               "fatal": [], "skipped": False}
+    image_breaker = image_breaker or breaker
     try:
-        if breaker.tripped.is_set():
+        if breaker.tripped.is_set() or image_breaker.tripped.is_set():
             result["skipped"] = True
             result["errors"].append("skipped: aborted after too many consecutive outage-type failures")
             return result
@@ -238,7 +247,7 @@ def warm_object(page_url, breaker, dry_run=False, image_base=None):
             result["warmed"] = len(warm_urls)
             return result
 
-        warm_images(result, warm_urls, breaker)
+        warm_images(result, warm_urls, image_breaker)
     except Exception as e:
         # One malformed object must not take down the whole run.
         result["fatal"].append(f"unexpected error: {type(e).__name__}: {e}")
@@ -267,7 +276,15 @@ def base_url(value):
         raise argparse.ArgumentTypeError("must look like http://host[:port]")
     if parts.path not in ("", "/") or parts.query or parts.fragment:
         raise argparse.ArgumentTypeError("must not include a path, query or fragment")
-    return value
+    if parts.username is not None or parts.password is not None:
+        raise argparse.ArgumentTypeError("must not include credentials")
+    try:
+        parts.port
+    except ValueError:
+        raise argparse.ArgumentTypeError("invalid port")
+    if not parts.hostname:
+        raise argparse.ArgumentTypeError("missing host")
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def main():
@@ -292,10 +309,12 @@ def main():
         urls = [line.strip() for line in f if line.strip() and not line.lstrip().startswith("#")]
 
     breaker = CircuitBreaker(args.max_consecutive_failures)
+    # Separate streak for the image service when it differs from Drupal.
+    image_breaker = CircuitBreaker(args.max_consecutive_failures) if args.image_base_url else breaker
     start = time.time()
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futures = [ex.submit(warm_object, u, breaker, args.dry_run, args.image_base_url) for u in urls]
+        futures = [ex.submit(warm_object, u, breaker, args.dry_run, args.image_base_url, image_breaker) for u in urls]
         for fut in concurrent.futures.as_completed(futures):
             r = fut.result()
             results.append(r)
@@ -311,7 +330,7 @@ def main():
     # them separately: otherwise a run where every page failed would exit 0.
     pages_errored = sum(1 for r in results if r["fatal"])
     pages_skipped = sum(1 for r in results if r["skipped"])
-    aborted = breaker.tripped.is_set()
+    aborted = breaker.tripped.is_set() or image_breaker.tripped.is_set()
     print(f"\nSummary: pages={len(urls)} processed={len(urls) - pages_skipped} warmed={total_warmed} "
           f"failed={total_failed} pages_errored={pages_errored} pages_skipped={pages_skipped} "
           f"elapsed={elapsed:.1f}s{' ABORTED' if aborted else ''}")
